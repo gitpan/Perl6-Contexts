@@ -2,8 +2,10 @@
 
 package Perl6::Contexts;
 
+use Data::Dumper 'Dumper'; # debug
+
 use 5.008;
-our $VERSION = '0.1';
+our $VERSION = '0.2';
 
 #
 # some preliminary goop is gotten out of the way first, and then we get into the meat which
@@ -30,6 +32,9 @@ my %knownuniverse;  # modules using us
 my %knowncvs;       # code values we've found (subroutines and anonymous subs)
 my @padtmps;        # pad entry offsets available for our consumption
 my $lastpadtmp;     # last one used - go round robin
+my %did_already;    # arrays were getting ref'd twice because parent info was stale and two rules matched
+
+my $lastpack; my $lastline; my $lastfile;
 
 # numericish opcodes, taken from perldoc Opcodes
 # stringwise: slt sgt sle sge seq sne scmp
@@ -97,6 +102,14 @@ CHECK {
         }
     }
 
+    foreach my $cv ((B::main_cv->PADLIST->ARRAY)[1]->ARRAY) {
+        # print "debug: main pad list: ", ref $cv, "\n";
+        next unless ref $cv eq 'B::CV';
+        # print "debug: found a cv!\n";
+        $knowncvs{$$cv} = $cv;
+    }
+
+
     my %donecvs; 
     my $curcv;
 
@@ -125,8 +138,7 @@ sub one_cv_at_a_time {
     my $curcv = shift;
     my $leave = $curcv->ROOT;
 
-    # grep { class($_) eq "CV" } B::main_cv->PADLIST->ARRAY->ARRAY; # cut and paste from B::Utils - sorry, Simon!
-    my @rootpad = ($curcv->PADLIST->ARRAY)[0]->ARRAY;
+    my @nonrootpad = ($curcv->PADLIST->ARRAY)[0]->ARRAY;
 
     # XXX - locate some temporaries we can use. 
     # this routine *should* build a list of all temporaries for the CV and then remove the list of
@@ -134,8 +146,8 @@ sub one_cv_at_a_time {
     # ringers. ringers also deal with the problem of modifiying the most complex statement
     # in a CV where all temps are in use a d we can't make more!
 
-    for(my $padindex = 0; $padindex < @rootpad; $padindex++) {
-        my $name = $rootpad[$padindex];
+    for(my $padindex = 0; $padindex < @nonrootpad; $padindex++) {
+        my $name = $nonrootpad[$padindex];
         # that's the inidivual entries of the names array - see the comments in pad.c in the perl source
         next if ref $name eq 'B::SPECIAL'; # B::SPECIALs are PADTMPs which are exactly what we *should* be using
         # print 'PVX: ', $name->PVX, ' NV: ', $name->NV,  ' IV: ', $name->IV, "\n";
@@ -149,12 +161,6 @@ sub one_cv_at_a_time {
         my $self = shift;       return unless $self and $$self;
         my $next = $self->next; return unless $next and $$next;
         $previous->{$$next} = $self; 
-        if($self->can('name') and $self->name eq 'anoncode') {
-            # found a new code value - yay!
-            my $cv = $rootpad[$self->targ];
-            # print "debug: anoncode targ: ", $self->targ(), " first op is: ", $cv->ROOT->name(), "\n";
-            $knowncvs{$$cv} = $cv;
-        }
     });
 
     walkoptree_slow($leave, \&look_for_things_to_diddle);
@@ -208,7 +214,18 @@ sub look_for_things_to_diddle {
     my $parent = $parents->[-1];
     my $non_null_parent = do { my $i = -1; $i-- until $parents->[$i]->name() ne 'null'; $parents->[$i]; };
 
-    return unless $self->name() eq 'padav' or $self->name() eq 'padhv';
+    if($self->name() eq 'nextstate') {
+
+        # record where we are in the program for any diagnstics
+        
+        # $lastpack = $self->stash()->PV(); # NAME();
+        $lastpack = '';
+        $lastfile = $self->file();
+        $lastline = $self->line();
+
+    }
+
+    # return unless $self->name() eq 'padav' or $self->name() eq 'padhv';
 
     # print "debug: go: ", $self->name(), "\n";
 
@@ -221,6 +238,9 @@ sub look_for_things_to_diddle {
         # this logic modifies both at the same time so that other B::Generate hacks have a
         # valid tree to work on and so that the bytecode actually executes.
         # see http://perldesignpatterns.com/?PerlAssembly
+
+        # print "debug: doing padav_to_ref $lastpack $lastfile $lastline\n";
+        # print "modifying ", $self->name, " at addresss ", $$self, "\n";
 
         my $padav = $self;
         my $nextstate = $previous->{$$padav} or die "no previous"; # may not actually be a nextstate but that's okey
@@ -252,11 +272,15 @@ sub look_for_things_to_diddle {
         $refgen->next($padav_next);
         $refgen->sibling($padav_sibling);
 
+        $did_already{$$self}++;
+
     };
 
     my $insert_rv2av = sub {
 
         # disused because of problems with perl not liking push $foo, $bar in the least ;)
+
+        # print "debug: doing insert_rv2av $lastpack $lastfile $lastline\n";
 
         my $padsv = $self;
         my $padsv_next = $padsv->next;
@@ -275,11 +299,15 @@ sub look_for_things_to_diddle {
         $rv2av->next($padsv_next);
         $rv2av->sibling($padsv_sibling);
 
+        $did_already{$$self}++;
+
     };
 
     my $insert_join = sub {
 
-        no warnings 'syntax';  # magic
+        # no warnings 'syntax';  # magic
+
+        # print "debug: doing insert_join $lastpack $lastfile $lastline\n";
 
         # perl -MO=Concise -e 'my @foo = (1..20); my $foo = "bar" . @foo . "baz";'
 
@@ -350,15 +378,19 @@ sub look_for_things_to_diddle {
         $join->sibling($padav_sibling);
         $join->next($padav_next); # splice out
 
+        $did_already{$$self}++;
+
     };
 
     # hash or array variable used in scalar context other than as boolean or number:
 
+    goto not_padav unless $self->name() eq 'padav' or $self->name() eq 'padhv';
     goto not_padav unless OPf_WANT_SCALAR == ($self->flags() & OPf_WANT);
     goto not_padav if $self->flags & OPf_REF; # things like 'exists' want a ref
     goto not_padav if exists $mathops->{$non_null_parent->name()};
     goto not_padav if exists $boolops->{$non_null_parent->name()};
     goto not_padav if exists $stringops->{$non_null_parent->name()};
+    goto not_padav if $did_already{$$self};
 
     $padav_to_ref->();
 
@@ -366,8 +398,10 @@ sub look_for_things_to_diddle {
 
     # both subroutine and method calls:
 
+    goto not_entersub unless $self->name() eq 'padav' or $self->name() eq 'padhv';
     goto not_entersub unless $non_null_parent->name() eq 'entersub';
     goto not_entersub unless OPf_WANT_LIST == ($self->flags() & OPf_WANT);
+    goto not_entersub if $did_already{$$self};
 
     $padav_to_ref->();
         
@@ -378,6 +412,7 @@ sub look_for_things_to_diddle {
     goto not_string unless $self->name eq 'padav';
     goto not_string unless exists $stringops->{$non_null_parent->name()};
     goto not_string unless OPf_WANT_SCALAR == ($self->flags() & OPf_WANT);
+    goto not_string if $did_already{$$self};
 
     die 'Due to a limitation of B::Generate and this module you declare several lexical variables: my($t1, $t2, $t3). ' .
         'This is sadly required to use arrays in string context with Perl6::Contexts. ' unless @padtmps;
@@ -652,11 +687,14 @@ able to allocate these for instructions so I have to use preexisting named varia
 
 =head1 VERSION
 
-0.1. Versions fixing bugs I've found and adding features I think of will increment the minor
+0.2. Fixes a show stopper bug that broke C<autobox> and method calls, where the same
+array or hash would be referencified twice. Code with anonymous subroutines 
+triggered a fatal bug.
+
+Versions fixing bugs I've found and adding features I think of will increment the minor
 version number. 1.0 will be released after a sufficient amount of user feedback suggestions
 that I'm not as far off in la-la land as I might be for all I know.
 This la-la land caveat applies to the Perl 6 specification as well, which I am doubtlessly botching.
-Version 1.0 will also include proper tests.
 
 =head1 SEE ALSO
 
