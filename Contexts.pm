@@ -1,11 +1,46 @@
 #!/usr/bin/perl
 
+# TODO - make this work:
+# use Perl6::Contexts;
+# my %hash = { foo => 10, bar => 20 };
+# foreach my $key (keys %hash) {
+#   print $key, "\n";
+# }
+# HASH(0x813808c)
+
+# TODO - make this work:
+# perl -MO=Concise -e 'my @foo; my $bar = [ 1 .. 20 ]; @foo = $bar;'
+# c     <;> nextstate(main 3 -e:1) v ->d
+# h     <2> aassign[t5] vKS ->i
+# -        <1> ex-list lK ->f
+# d           <0> pushmark s ->e
+# e           <0> padsv[$bar:2,3] l ->f
+# -        <1> ex-list lK ->h
+# f           <0> pushmark s ->g
+# g           <0> padav[@foo:1,3] lRM* ->h
+
+# Reference found where even-sized list expected = my %foo = {  }
+
+# TODO - make this work:
+# perl -MO=Concise -e 'localtime->date();'
+# 7  <@> leave[1 ref] vKP/REFC ->(end)
+# 1     <0> enter ->2
+# 2     <;> nextstate(main 1 -e:1) v ->3
+# 6     <1> entersub[t2] vKS/TARG ->7
+# 3        <0> pushmark s ->4
+# 4        <0> localtime[t1] sM ->5
+# 5        <$> method_named(PVIV "date") ->6
+# this will require numerous helper classes, one for stat buffers, time,
+# and any other built-in that returns a list in list context. perhaps can
+# reuse existing classes like Date::Manip.
+
+
 package Perl6::Contexts;
 
 use Data::Dumper 'Dumper'; # debug
 
 use 5.008;
-our $VERSION = '0.2';
+our $VERSION = '0.3';
 
 #
 # some preliminary goop is gotten out of the way first, and then we get into the meat which
@@ -27,6 +62,7 @@ sub OPfDEREF_SV () { 32|64 } # #define OPpDEREF_SV             (32|64) /*   Want
 use strict;
 use warnings;
 
+my $redo_reverse_indices; # recompute $previous for the current CV
 my $previous = {};  # opposite of next, inferred from next
 my %knownuniverse;  # modules using us
 my %knowncvs;       # code values we've found (subroutines and anonymous subs)
@@ -157,18 +193,22 @@ sub one_cv_at_a_time {
         # print "debug: $padindex is a temp for us - ", $name->PVX, "\n";
     }
 
-    walkoptree_slow($leave, sub { 
-        my $self = shift;       return unless $self and $$self;
-        my $next = $self->next; return unless $next and $$next;
-        $previous->{$$next} = $self; 
-    });
+    $redo_reverse_indices = sub {
+        walkoptree_slow($leave, sub { 
+            my $self = shift;       return unless $self and $$self;
+            my $next = $self->next; return unless $next and $$next;
+            $previous->{$$next} = $self; 
+        });
+    };
+
+    $redo_reverse_indices->();
 
     walkoptree_slow($leave, \&look_for_things_to_diddle);
 
     # B::main_root()->linklist();
 
-    # print $$leave, " basic:\n"; B::Concise::concise_cv_obj('basic', $curcv);
-    # print $$leave, " exec:\n";  B::Concise::concise_cv_obj('exec', $curcv);
+    # print $$leave, " basic:\n"; B::Concise::concise_cv_obj('basic', $curcv); # debug
+    # print $$leave, " exec:\n";  B::Concise::concise_cv_obj('exec', $curcv); # debug
 
     return 1;
 }
@@ -185,11 +225,16 @@ sub walkoptree_slow {
     # warn(sprintf("walkoptree: %d. %s\n", $level, peekop($op))) if $debug;
     $sub->($op, $level, \@parents);
     if ($op->can('flags') and $op->flags() & OPf_KIDS) {
-        # print "debug: go: ", $op->name(), "\n";
+        # print "debug: go: ", '  ' x $level, $op->name(), "\n"; # debug
         push @parents, $op;
-        for (my $kid = $op->first(); $$kid; $kid = $kid->sibling()) {
-            walkoptree_slow($kid, $sub, $level + 1);
-        }
+        my $kid = $op->first();
+        my $next;
+        next_kid:
+          # was being changed right out from under us, so pre-compute
+          $next = 0; $next = $kid->sibling() if $$kid;
+          walkoptree_slow($kid, $sub, $level + 1);
+          $kid = $next;
+          goto next_kid if $kid;
         pop @parents;
     }
     if (B::class($op) eq 'PMOP' && $op->pmreplroot() && ${$op->pmreplroot()}) {
@@ -273,6 +318,7 @@ sub look_for_things_to_diddle {
         $refgen->sibling($padav_sibling);
 
         $did_already{$$self}++;
+        $redo_reverse_indices->();
 
     };
 
@@ -300,6 +346,7 @@ sub look_for_things_to_diddle {
         $rv2av->sibling($padsv_sibling);
 
         $did_already{$$self}++;
+        $redo_reverse_indices->();
 
     };
 
@@ -357,7 +404,6 @@ sub look_for_things_to_diddle {
         $pushmark->sibling($rv2sv);
         $pushmark->next($const);
 
-        # $const->sibling($join); # wrong - wrong const!
         $const->next($rv2sv);
 
         $rv2sv->sibling($padav);
@@ -379,6 +425,7 @@ sub look_for_things_to_diddle {
         $join->next($padav_next); # splice out
 
         $did_already{$$self}++;
+        $redo_reverse_indices->();
 
     };
 
@@ -402,7 +449,6 @@ sub look_for_things_to_diddle {
     goto not_entersub unless $non_null_parent->name() eq 'entersub';
     goto not_entersub unless OPf_WANT_LIST == ($self->flags() & OPf_WANT);
     goto not_entersub if $did_already{$$self};
-
     $padav_to_ref->();
         
     not_entersub:
@@ -414,7 +460,7 @@ sub look_for_things_to_diddle {
     goto not_string unless OPf_WANT_SCALAR == ($self->flags() & OPf_WANT);
     goto not_string if $did_already{$$self};
 
-    die 'Due to a limitation of B::Generate and this module you declare several lexical variables: my($t1, $t2, $t3). ' .
+    die 'Due to a limitation of B::Generate and this module you must declare several lexical variables: my($t1, $t2, $t3). ' .
         'This is sadly required to use arrays in string context with Perl6::Contexts. ' unless @padtmps;
 
     $insert_join->();
@@ -685,10 +731,16 @@ that it can push to the stack any time it likes without having to allocate it. N
 instruction runs again it knows that it can reuse the same variable. F<B::Generate> isn't
 able to allocate these for instructions so I have to use preexisting named variables.
 
-=head1 VERSION
+=head1 HISTORY
 
-0.2. Fixes a show stopper bug that broke C<autobox> and method calls, where the same
-array or hash would be referencified twice. Code with anonymous subroutines 
+0.3 Fixes a serious bug where only the first of any number of arrays or hashes passed
+to a subroutine would referencify. The logic to loop through through the bytecode
+couldn't handle the bytecode changing out from under it and it lost its place.
+Added several todo list items to the top of the file for myself and those curious 
+about possible future development.
+
+0.2 Fixes a show stopper bug that broke C<autobox> and method calls, where the same
+array or hash would referencify twice. Code with anonymous subroutines 
 triggered a fatal bug.
 
 Versions fixing bugs I've found and adding features I think of will increment the minor
@@ -1047,3 +1099,40 @@ perl -MO=Concise -e 'print $", "\n";'
 # XXX \(list) should (maybe) be converted to [list] - should be a matter of swapping a refgen with a srefgen
 
 
+--------
+
+
+Bug!
+
+debug: go: leavesub
+debug: go:   lineseq
+debug: go:     sassign
+debug: go:       shift
+debug: go:         rv2av
+debug: go:     sassign
+debug: go:       shift
+debug: go:         rv2av
+debug: go:     print
+debug: go:       aelem
+debug: go:         rv2av
+debug: go:     print
+debug: go:       aelem
+debug: go:         rv2av
+
+  use Perl6::Contexts;
+
+  sub do_something {
+    my $array1_ref = shift;
+    my $array2_ref = shift;
+    print $array1_ref->[0], "\n";
+    print $array2_ref->[0], "\n";
+  }
+
+  my @array1 = map int rand 100, 1 .. 10;
+  my @array2 = map int rand 100, 1 .. 10;
+
+  do_something(@array1, @array2);
+
+only modifying the first one... reverse links (parent, previous) getting out of date?
+
+fixed
