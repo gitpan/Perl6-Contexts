@@ -1,5 +1,11 @@
 #!/usr/bin/perl
 
+# Here, localtime() should return a stringified date or an object
+# use Perl6::Contexts;
+# my @stuff = (1, 2, 3, localtime);
+# print "@stuff\n";
+# 1 2 3 27 12 10 8 8 104 3 251 0
+
 # TODO - make this work:
 # use Perl6::Contexts;
 # my %hash = { foo => 10, bar => 20 };
@@ -37,10 +43,10 @@
 
 package Perl6::Contexts;
 
-use Data::Dumper 'Dumper'; # debug
+# use Data::Dumper 'Dumper'; # debug
 
 use 5.008;
-our $VERSION = '0.3';
+our $VERSION = '0.4';
 
 #
 # some preliminary goop is gotten out of the way first, and then we get into the meat which
@@ -54,13 +60,13 @@ use B::Generate;
 use B::Concise 'concise_cv'; # 'walk_topdown'
 # use B::Utils;
 
+use strict;
+use warnings;
+
 sub OPfDEREF    () { 32|64 } # #define OPpDEREF                (32|64) /* autovivify: Want ref to something: */
 sub OPfDEREF_AV () { 32 }    # #define OPpDEREF_AV             32      /*   Want ref to AV. */
 sub OPfDEREF_HV () { 64 }    # #define OPpDEREF_HV             64      /*   Want ref to HV. */
 sub OPfDEREF_SV () { 32|64 } # #define OPpDEREF_SV             (32|64) /*   Want ref to SV. */
-
-use strict;
-use warnings;
 
 my $redo_reverse_indices; # recompute $previous for the current CV
 my $previous = {};  # opposite of next, inferred from next
@@ -174,6 +180,7 @@ sub one_cv_at_a_time {
     my $curcv = shift;
     my $leave = $curcv->ROOT;
 
+    return if $curcv->PADLIST->isa('B::SPECIAL');
     my @nonrootpad = ($curcv->PADLIST->ARRAY)[0]->ARRAY;
 
     # XXX - locate some temporaries we can use. 
@@ -483,24 +490,23 @@ used in non-numeric scalar context or as function arguments
 =head1 SYNOPSIS
 
   my @foo = ( 1 .. 20 ); 
-  my $foo = @foo;                  # same as my $foo = \@foo;
+  my $foo = @foo;                  # same as: my $foo = \@foo;
   my $foo = 0 + @foo;              # unchanged - length of @foo
-  $obj->some_method(10, 20, @foo); # same as $obj->some_method(10, 20, \@foo);
-  some_function(10, 20, @foo);     # same as some_function(10, 20, \@foo);
+  $obj->some_method(10, 20, @foo); # same as: $obj->some_method(10, 20, \@foo);
+  some_function(10, 20, @foo);     # same as: some_function(10, 20, \@foo);
 
 =head1 DESCRIPTION
 
-L<Perl6::Contexts> makes Perl 5 behave more like Perl 6 with reguard to the 
-meaning of array and hash variables when used in scalar context and function
-calls.
+L<Perl6::Contexts> makes Perl 5 behave more like Perl 6 with regard to the 
+array and hash variables as used as arguments to operators, method calls, and functions.
 
+This module doesn't add new syntax -- it merely changes the meaning of existing
+syntax.
 Using this module to make Perl 5 more like Perl 6 won't go very far towards
 writing Perl 5 that will run under Perl 6 but it I<will> help you get used to
-some of the changes. (As far as legacy code is concerned, check out the
-excellent L<PONIE> project - everyones money is on PONIE!).
+some of the changes.
 
-This module doesn't add new syntax - it merely changes the meaning of existing
-syntax.
+To run legacy Perl 5 along side Perl 6, check out L<PONIE> or L<Inline::Pugs>.
 
 =head2 Context
 
@@ -670,18 +676,25 @@ To accomplish this without F<autobox>, you may take a slice of the entire array:
 
 =head1 BUGS
 
-There are no meaningful texts at this time. That's on the top of the list
-for 0.2. Consider this a preview release.
+Most of these bugs are fixable but why should I bother if no one is actually using
+this module?
+Want a bug fixes?
+Email me.
+A little encouragement goes a long way.
 
-F<autobox::Core> makes assumptions about what Perl 6 will name autoboxed methods
-on primtive types. As I learn more (and more is published) these examples and
-F<autobox::Core> will change to be consistent with Perl 6. In other words,
-do not rely on the interface staying the same until version 1.0 (and then you're 
-taking your own chances but I'll try my best).
+Until I get around to finishing reworking C<B::Generate>, C<B::Generate-1.06> needs
+line 940 of C<B-Generate-1.06/lib/B/Generate.c> changed to read 
+C<o = Perl_fold_constants(o);> (the word C<Perl> and an understore should be inserted).
+This is in order to build C<B::Generate-1.06> on newer Perls.
+
+C<..> and C<...> aren't yet recognized numeric operators.
+
+C<@arr = ( @arr2, @arr3, @arr4 )> should not flatten (I think) but currently does.
 
 Scalar variables used in conditionals (such as C<if> and C<and>) don't
 dereference themselves and reference values are always true
-(unless you do something special). Hence this will always die:
+(unless you do something special). 
+Hence this will always die:
 
   use Perl6::Contexts;
   my @arr = ( );      # completely empty arrays evaluate false
@@ -706,24 +719,28 @@ Of course, it would be nice if the core did the "right thing" ;)
 The unary C<*> operator doesn't flatten lists as it does in Perl 6. 
 Instead, F<autobox> and C<< ->flatten >> must be used for this, or
 synonymously, C<< ->elements >>.
+As far as I know, this is unfixable without resorting to a source filter, 
+which I won't do in this module.
 
-C<scalar> is considered to provide numeric context. This is not consistent
+C<scalar> is considered to provide numeric context. 
+This is not consistent
 with Perl 6, where C<string>, C<bool>, C<bit>, C<string>, C<int>, C<num>, and C<float>
-generate contexts, much like C<scalar> does in Perl 5. This module
-should export those keywords.
+generate contexts, much like C<scalar> does in Perl 5. 
+This module should, but doesn't, export those keywords.
 
 While C<0 + @arr> accidentally works to put C<@arr> in numeric context and get its length,
 no unary C<~> (yet) exists to force string context (though it could - it would mean no
 more negating strings full of bits without calling a function in another module to do it).
 
 C<< my @array = $arrayref >> should, but doesn't, dereference C<$arrayref> and dump its
-contents into C<@array>. This can, and should, be done but I haven't gotten to it yet.
+contents into C<@array>. 
+This can, and should, be done but I haven't gotten to it yet.
 
 Hashes in strings should interpolate but that's outside the scope of this module.
 See L<Perl6::Interpolators> for an implementation.
 
-Making users create temporaries is a kludge as ugly as any. I plan to roll this
-ability into F<B::Generate>.
+Making users create temporaries is a kludge as ugly as any. 
+I plan to roll this ability into F<B::Generate>.
 Why are C<my $t1>, C<my $t2>, and so on, required?
 Perl associates nameless lexical variables with operations to speed up the stack machine.
 Each operation has its own virtually private scalar value, array value, hash value, or so on,

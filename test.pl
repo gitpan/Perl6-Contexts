@@ -23,7 +23,7 @@ my $foo;
 my $t1; my $t2; my $t3;
 
 $foo = @bar;
-ok($foo->[1] == $bar[1], 'reference context - arrays');
+ok($foo->[1] == $bar[1], 'reference context - arrays part 1');
 
 # 3
 
